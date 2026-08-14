@@ -1,0 +1,13 @@
+# Generated / large data (raw sources stay local)
+data/raw/
+data/preprocessed/
+data/cleaned/
+data/finalized/*.csv
+!data/finalized/finalized_manifest.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env

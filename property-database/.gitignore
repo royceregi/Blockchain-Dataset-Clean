@@ -1,0 +1,17 @@
+# Secrets and local env
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Cleaned CSVs copied from preprocessing/
+data/cleaned/*.csv
+data/
+
+# Database dumps
+*.dump
+property_db_relational.sql

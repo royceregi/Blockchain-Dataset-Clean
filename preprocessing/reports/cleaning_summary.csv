@@ -1,0 +1,17 @@
+metric,value,dataset,rows,columns
+transactions_original_rows,1047965.0,,,
+transactions_invalid_dates,5.0,,,
+transactions_exact_duplicates,0.0,,,
+transactions_duplicate_ids,0.0,,,
+transactions_final_rows,236607.0,,,
+,,transactions_cleaned.csv,236607.0,33.0
+,,property_enriched_cleaned.csv,91037.0,78.0
+blockchain_ledger_cleaned.csv_original_rows,236607.0,,,
+blockchain_ledger_cleaned.csv_final_rows,236607.0,,,
+,,blockchain_ledger_cleaned.csv,236607.0,16.0
+users_stakeholders_cleaned.csv_original_rows,50000.0,,,
+users_stakeholders_cleaned.csv_final_rows,50000.0,,,
+,,users_stakeholders_cleaned.csv,50000.0,11.0
+query_logs_cleaned.csv_original_rows,50000.0,,,
+query_logs_cleaned.csv_final_rows,50000.0,,,
+,,query_logs_cleaned.csv,50000.0,7.0

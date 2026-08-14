@@ -1,0 +1,11 @@
+file,rows,columns,duplicate_rows,date_column,invalid_dates,min_date,max_date
+Transactions.csv,1047965,32,0,instance_date,5.0,1995-03-07,2023-03-17
+blockchain_transaction_ledger_dubai.csv,236607,16,0,Block_Timestamp,0.0,2021-01-02,2023-03-17
+blockchain_transactions.csv,100000,12,0,Timestamp,60460.0,2023-01-01,2025-12-12
+dubai_property_MERGED_enriched.csv,236607,78,0,instance_date,145570.0,2021-01-02,2023-12-03
+dubai_property_transactions_project_ready_fully_clean.csv,236607,41,0,instance_date,0.0,2021-01-02,2023-03-17
+property_records.csv,100000,20,0,Registration_Date,60413.0,2010-01-01,2023-12-12
+query_interaction_logs.csv,100000,9,0,Timestamp,0.0,2025-01-01,2025-12-30
+query_interaction_logs_dubai.csv,50000,7,0,,,,
+users_stakeholders.csv,100000,12,0,,,,
+users_stakeholders_dubai.csv,50000,11,0,,,,

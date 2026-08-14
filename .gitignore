@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Large datasets (keep scripts and docs; data lives locally)
+preprocessing/data/raw/
+preprocessing/data/preprocessed/
+preprocessing/data/cleaned/
+preprocessing/data/finalized/*.csv
+!preprocessing/data/finalized/finalized_manifest.csv
+property-database/data/
+
+# Database dumps
+*.dump
+property_db_relational.sql

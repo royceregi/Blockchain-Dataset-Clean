@@ -1,0 +1,17 @@
+,missing_count,missing_percent
+Transaction_ID,0,0.0
+Blockchain_Transaction_Hash,0,0.0
+Previous_Transaction_Hash,0,0.0
+Property_Hash,0,0.0
+Block_Number,0,0.0
+Block_Timestamp,0,0.0
+Property_ID,0,0.0
+From_Wallet,0,0.0
+To_Wallet,0,0.0
+Transaction_Type,0,0.0
+Transaction_Value_AED,0,0.0
+Smart_Contract_Address,0,0.0
+Transaction_Status,0,0.0
+Digital_Signature,0,0.0
+Consensus_Verification,0,0.0
+Gas_Fee_AED,0,0.0
