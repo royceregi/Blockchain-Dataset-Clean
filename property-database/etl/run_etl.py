@@ -1,4 +1,4 @@
-"""Run full ETL: staging already loaded → transform into 12 final tables."""
+"""Run full ETL: staging already loaded → transform into 16 main tables (1.txt)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def main():
     # One transaction: failure rolls back all final-table writes
     with engine.begin() as conn:
         run_all_transforms(conn)
-    print("ETL finished successfully.")
+    print("ETL finished successfully → main.*")
 
 
 if __name__ == "__main__":

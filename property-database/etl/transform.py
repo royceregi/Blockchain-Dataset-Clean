@@ -1,6 +1,8 @@
-"""Transform staging → 12 normalized tables (table.md design)."""
+"""Transform staging → 16 normalized main tables (1.txt / PropGuard model)."""
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta
 
 import pandas as pd
 from sqlalchemy import text
@@ -8,30 +10,64 @@ from sqlalchemy import text
 from utils import (
     clean_str,
     normalize_property_id,
-    sha256_text,
+    prefer_existing_or_plain,
+    split_csv_ids,
     to_bool,
     to_date,
     to_float,
     to_int,
-    to_time,
     to_timestamp,
     username_from_user_id,
 )
+
+MAIN = "main"
+
+# Enriched-only columns: overlay from property_enriched when merging with transactions
+ENRICHMENT_COLUMNS = {
+    "owner_id", "owner_name", "owner_nic", "owner_wallet_address",
+    "seller_id", "seller_name", "seller_wallet_address",
+    "witness_1_name", "witness_2_name", "notary_name",
+    "property_name", "property_group", "legal_status", "encumbrances",
+    "verification_status", "title_deed_number", "survey_plan_number",
+    "boundary_north", "boundary_south", "boundary_east", "boundary_west",
+    "gps_latitude", "gps_longitude", "document_text", "document_hash",
+    "property_hash", "previous_transaction_hash", "blockchain_transaction_hash",
+    "block_number", "block_timestamp", "smart_contract_address",
+    "day_of_week", "day_of_month", "transaction_time", "full_timestamp",
+    "previous_usage_type", "previous_sub_type", "previous_value", "value_change_pct",
+    "land_use_zone", "registration_fee_aed", "trustee_office_fee_aed", "total_fees_paid_aed",
+    "calculated_price_per_area", "year", "month", "quarter",
+}
 
 
 def _read(conn, sql: str) -> pd.DataFrame:
     return pd.read_sql(text(sql), conn)
 
 
+def _write_df(conn, table: str, rows: list[dict], chunksize: int = 1000) -> int:
+    if not rows:
+        print(f"  {MAIN}.{table}: 0", flush=True)
+        return 0
+    pd.DataFrame(rows).to_sql(
+        table, conn, schema=MAIN, if_exists="append", index=False, method="multi", chunksize=chunksize
+    )
+    print(f"  {MAIN}.{table}: {len(rows):,}", flush=True)
+    return len(rows)
+
+
 def _clear_final_tables(conn) -> None:
-    # Child → parent order
+    """Truncate all main dataset tables (users reloaded from seed + staging)."""
     tables = [
+        "agent_runs",
+        "query_retrievals",
         "query_logs",
+        "risk_indicators",
+        "risk_assessments",
+        "transaction_features",
         "blockchain_transactions",
         "property_documents",
         "registration_details",
         "transaction_parties",
-        "property_classifications",
         "property_ownership_history",
         "property_transactions",
         "transaction_types",
@@ -40,226 +76,298 @@ def _clear_final_tables(conn) -> None:
         "users",
     ]
     for t in tables:
-        conn.execute(text(f"TRUNCATE TABLE {t} RESTART IDENTITY CASCADE"))
+        conn.execute(text(f"TRUNCATE TABLE {MAIN}.{t} RESTART IDENTITY CASCADE"))
 
 
-def transform_users(conn, enriched: pd.DataFrame) -> dict[str, dict]:
-    users_df = _read(conn, "SELECT * FROM staging_users")
-    users: dict[str, dict] = {}
+# Demo system accounts (same as sql/07_seed_users.sql). password_hash / nic_hash already hashed.
+SYSTEM_USERS = [
+    {
+        "user_id": "SYS000001",
+        "username": "superadmin",
+        "full_name": "Super Admin",
+        "email": "superadmin@propguard.ai",
+        "phone_number": "+971500000001",
+        "password_hash": "pbkdf2_sha256$10000$fd995af5b343dad5fad10b83935e4d8a$72b8563f0cbe253c26dc381b845381b33001b785e6e0be6134fb25f79bcfb4d3",
+        "role": "SUPER_ADMIN",
+        "wallet_address": "0xSuperAdminWallet001",
+        "nic_hash": "2369e2bf0ed3029a338aa60c9660316d0ae901ff77fb072c46a8d00b72dc85d6",
+        "kyc_status": "Verified",
+        "access_level": "Full",
+        "mfa_enabled": True,
+        "is_active": True,
+    },
+    {
+        "user_id": "SYS000002",
+        "username": "landregistry",
+        "full_name": "Land Registry Officer",
+        "email": "registry@propguard.ai",
+        "phone_number": "+971500000002",
+        "password_hash": "pbkdf2_sha256$10000$2f0b94c24f59e75a3b35686899670651$ba947dab744e5626e55442f0d37ceb4118fbafef3ad68f0ad452ab8b064782da",
+        "role": "LAND_REGISTRY",
+        "wallet_address": "0xLandRegistryWallet002",
+        "nic_hash": "46d7b6ce605e42ff2d10773a32aeb8c570944258f33deb531c4cd3569c7074da",
+        "kyc_status": "Verified",
+        "access_level": "Registry",
+        "mfa_enabled": True,
+        "is_active": True,
+    },
+    {
+        "user_id": "SYS000003",
+        "username": "realestate",
+        "full_name": "Real Estate Company",
+        "email": "realestate@propguard.ai",
+        "phone_number": "+971500000003",
+        "password_hash": "pbkdf2_sha256$10000$daa3d3f8025006436dbedfcdd13ddae6$6200f997373d7124d5f5aa2ad2a48916980bce929c86df789c6fa751154b20c0",
+        "role": "REAL_ESTATE_COMPANY",
+        "wallet_address": "0xRealEstateWallet003",
+        "nic_hash": "762f33f3d9cb6bdb55978621ebc031dcf4238000e49b8eb6b1ad377f7841e33f",
+        "kyc_status": "Verified",
+        "access_level": "Company",
+        "mfa_enabled": False,
+        "is_active": True,
+    },
+    {
+        "user_id": "SYS000004",
+        "username": "publicuser",
+        "full_name": "Public User Demo",
+        "email": "public@propguard.ai",
+        "phone_number": "+971500000004",
+        "password_hash": "pbkdf2_sha256$10000$8c113efdf5cf5d05261f2e02ac02471f$daad8b8a5bc595a691ec82b21603ed0f0ea6038a9eb2d8663e19d6a4c1481a7e",
+        "role": "PUBLIC_USER",
+        "wallet_address": "0xPublicUserWallet004",
+        "nic_hash": "3d2a7ac6db78efe216083b864ba755c115266ec3754ed08b993f4ee13e2d9290",
+        "kyc_status": "Pending",
+        "access_level": "Basic",
+        "mfa_enabled": False,
+        "is_active": True,
+    },
+]
 
-    def upsert(user_id, name=None, role=None, email=None, contact=None,
-               wallet=None, password_hash=None, nic=None, kyc=None,
-               access=None, mfa=None):
-        uid = clean_str(user_id)
-        if uid is None:
-            return
-        row = users.get(uid, {
+
+def transform_users(conn) -> set[str]:
+    """Load system seeds + cleaned stakeholders into main.users.
+
+    Hash policy: keep existing password/nic hashes when present; otherwise store plain NIC.
+    """
+    rows = list(SYSTEM_USERS)
+    seen = {r["user_id"] for r in rows}
+    seen_usernames = {r["username"] for r in rows}
+
+    staging_users = _read(conn, "SELECT * FROM staging.users")
+    for r in staging_users.itertuples(index=False):
+        uid = clean_str(r.user_id)
+        if uid is None or uid in seen:
+            continue
+        username = username_from_user_id(uid)
+        if username in seen_usernames:
+            username = f"{username}_{uid[-4:]}"
+        seen.add(uid)
+        seen_usernames.add(username)
+        rows.append({
             "user_id": uid,
-            "username": username_from_user_id(uid),
-            "name": None,
-            "email": None,
-            "contact": None,
-            "role": None,
-            "wallet_address": None,
-            "password_hash": None,
-            "nic_hash": None,
-            "kyc_status": None,
-            "access_level": None,
-            "mfa_enabled": False,
+            "username": username,
+            "full_name": clean_str(r.full_name),
+            "email": clean_str(r.email),
+            "phone_number": clean_str(r.phone_number),
+            # CSV auth_password_hash is already hashed → keep it; else leave None
+            "password_hash": prefer_existing_or_plain(getattr(r, "auth_password_hash", None)),
+            "role": clean_str(r.role) or "PUBLIC_USER",
+            "wallet_address": clean_str(r.wallet_address),
+            # owner_nic is plain in CSV; store plain in nic_hash for now (app will hash later)
+            "nic_hash": prefer_existing_or_plain(None, getattr(r, "owner_nic", None)),
+            "kyc_status": clean_str(r.kyc_status),
+            "access_level": clean_str(r.access_level),
+            "mfa_enabled": to_bool(r.mfa_enabled) or False,
             "is_active": True,
         })
-        if name:
-            row["name"] = clean_str(name) or row["name"]
-        if role:
-            row["role"] = clean_str(role) or row["role"]
-        if email:
-            row["email"] = clean_str(email) or row["email"]
-        if contact:
-            row["contact"] = clean_str(contact) or row["contact"]
-        if wallet:
-            row["wallet_address"] = clean_str(wallet) or row["wallet_address"]
-        if password_hash:
-            row["password_hash"] = clean_str(password_hash) or row["password_hash"]
-        if nic:
-            row["nic_hash"] = sha256_text(nic) or row["nic_hash"]
-        if kyc:
-            row["kyc_status"] = clean_str(kyc) or row["kyc_status"]
-        if access:
-            row["access_level"] = clean_str(access) or row["access_level"]
-        if mfa is not None:
-            b = to_bool(mfa)
-            if b is not None:
-                row["mfa_enabled"] = b
-        users[uid] = row
 
-    for r in users_df.itertuples(index=False):
-        upsert(
-            r.user_id,
-            name=r.full_name,
-            role=r.role,
-            email=r.email,
-            contact=r.phone_number,
-            wallet=r.wallet_address,
-            password_hash=r.auth_password_hash,
-            nic=r.owner_nic,
-            kyc=r.kyc_status,
-            access=r.access_level,
-            mfa=r.mfa_enabled,
-        )
-
-    # Extra people from enriched (owners / sellers). Witnesses/notaries often have names only.
-    for r in enriched.itertuples(index=False):
-        upsert(r.owner_id, name=r.owner_name, role="Owner", wallet=r.owner_wallet_address, nic=r.owner_nic)
-        upsert(r.seller_id, name=r.seller_name, role="Seller", wallet=r.seller_wallet_address)
-
-    rows = list(users.values())
-    if rows:
-        pd.DataFrame(rows).to_sql("users", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-    print(f"  users: {len(rows):,}")
-    return users
+    _write_df(conn, "users", rows, chunksize=2000)
+    return {r["user_id"] for r in rows}
 
 
-def transform_properties_and_locations(conn, enriched: pd.DataFrame) -> set[str]:
-    # Latest transaction per property drives "current" property attributes
-    df = enriched.copy()
+def merge_transaction_sources(transactions: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFrame:
+    """Merge DLD transactions with enrichment on transaction_id — no duplicate fact rows."""
+    tx = transactions.copy()
+    enr = enriched.copy()
+
+    for df in (tx, enr):
+        if "transaction_id" in df.columns:
+            df["transaction_id"] = df["transaction_id"].map(clean_str)
+
+    tx = tx.dropna(subset=["transaction_id"]).drop_duplicates(subset=["transaction_id"], keep="first")
+    enr = enr.dropna(subset=["transaction_id"]).drop_duplicates(subset=["transaction_id"], keep="first")
+
+    tx = tx.set_index("transaction_id")
+    enr = enr.set_index("transaction_id")
+    all_ids = tx.index.union(enr.index)
+
+    merged = pd.DataFrame(index=all_ids)
+    for col in tx.columns:
+        merged[col] = tx[col]
+
+    for col in enr.columns:
+        if col not in merged.columns:
+            merged[col] = enr[col]
+        elif col in ENRICHMENT_COLUMNS:
+            merged[col] = enr[col].combine_first(merged[col])
+        else:
+            merged[col] = merged[col].combine_first(enr[col])
+
+    merged["property_id"] = merged.apply(
+        lambda r: normalize_property_id(r.get("property_id")),
+        axis=1,
+    )
+
+    # Prefer enriched timestamps when present
+    if "full_timestamp" in merged.columns:
+        merged["transaction_datetime_src"] = merged["full_timestamp"].combine_first(merged.get("instance_date"))
+    else:
+        merged["transaction_datetime_src"] = merged.get("instance_date")
+
+    merged.index.name = "transaction_id"
+    return merged.reset_index()
+
+
+def transform_properties_and_locations(conn, merged: pd.DataFrame, user_ids: set[str]) -> set[str]:
+    df = merged.copy()
     df["property_id_n"] = df["property_id"].map(normalize_property_id)
-    df["tx_dt"] = pd.to_datetime(df["full_timestamp"], errors="coerce")
+    df["tx_dt"] = pd.to_datetime(df["transaction_datetime_src"], errors="coerce")
     df = df.dropna(subset=["property_id_n"])
     df = df.sort_values(["property_id_n", "tx_dt"])
-    latest = df.groupby("property_id_n", as_index=False).tail(1)
 
     prop_rows = []
     loc_rows = []
-    for r in latest.itertuples(index=False):
-        pid = r.property_id_n
+    seen_deed: set[str] = set()
+    seen_survey: set[str] = set()
+
+    for pid, group in df.groupby("property_id_n", sort=False):
+        r = group.iloc[-1]
+        deed = clean_str(getattr(r, "title_deed_number", None))
+        survey = clean_str(getattr(r, "survey_plan_number", None))
+        if deed and deed in seen_deed:
+            deed = f"{deed}-{pid[:8]}"
+        if survey and survey in seen_survey:
+            survey = f"{survey}-{pid[:8]}"
+        if deed:
+            seen_deed.add(deed)
+        if survey:
+            seen_survey.add(survey)
+
+        # Prefer latest row that has a known owner_id (enrichment may not be on last tx)
+        owner_id = None
+        for cand in reversed(list(group.itertuples(index=False))):
+            oid = clean_str(getattr(cand, "owner_id", None))
+            if oid in user_ids:
+                owner_id = oid
+                break
+
         prop_rows.append({
             "property_id": pid,
-            "title_deed_number": clean_str(r.title_deed_number),
-            "property_name": clean_str(r.property_name),
-            "address": clean_str(r.area_name),
-            "district": clean_str(r.area_name),
+            "title_deed_number": deed,
+            "property_name": clean_str(getattr(r, "property_name", None)),
+            "address": clean_str(getattr(r, "area_name", None)),
+            "district": clean_str(getattr(r, "area_name", None)),
             "city": "Dubai",
-            "latitude": to_float(r.gps_latitude),
-            "longitude": to_float(r.gps_longitude),
-            "land_area": to_float(r.procedure_area),
+            "latitude": to_float(getattr(r, "gps_latitude", None)),
+            "longitude": to_float(getattr(r, "gps_longitude", None)),
+            "land_area": to_float(getattr(r, "procedure_area", None)),
             "area_unit": "sqm",
-            "land_type": clean_str(r.land_use_zone) or clean_str(r.property_usage),
-            "survey_plan_number": clean_str(r.survey_plan_number),
-            "current_owner_id": clean_str(r.owner_id),
-            "current_usage_type": clean_str(r.property_usage),
-            "current_subtype": clean_str(r.property_sub_type),
-            "current_value": to_float(r.actual_worth),
-            "legal_status": clean_str(r.legal_status),
-            "verification_status": clean_str(r.verification_status),
-            "encumbrances": clean_str(r.encumbrances),
-            "boundary_north": clean_str(r.boundary_north),
-            "boundary_south": clean_str(r.boundary_south),
-            "boundary_east": clean_str(r.boundary_east),
-            "boundary_west": clean_str(r.boundary_west),
+            "land_type": clean_str(getattr(r, "land_use_zone", None)) or clean_str(getattr(r, "property_usage", None)),
+            "survey_plan_number": survey,
+            "current_owner_id": owner_id,
+            "current_usage_type": clean_str(getattr(r, "property_usage", None)),
+            "current_subtype": clean_str(getattr(r, "property_sub_type", None)),
+            "current_value": to_float(getattr(r, "actual_worth", None)),
+            "legal_status": clean_str(getattr(r, "legal_status", None)),
+            "verification_status": clean_str(getattr(r, "verification_status", None)),
+            "encumbrances": clean_str(getattr(r, "encumbrances", None)),
+            "boundary_north": clean_str(getattr(r, "boundary_north", None)),
+            "boundary_south": clean_str(getattr(r, "boundary_south", None)),
+            "boundary_east": clean_str(getattr(r, "boundary_east", None)),
+            "boundary_west": clean_str(getattr(r, "boundary_west", None)),
         })
         loc_rows.append({
             "property_id": pid,
-            "district": clean_str(r.area_name),
+            "district": clean_str(getattr(r, "area_name", None)),
             "city": "Dubai",
-            "latitude": to_float(r.gps_latitude),
-            "longitude": to_float(r.gps_longitude),
-            "area_name": clean_str(r.area_name),
-            "building_name": clean_str(r.building_name),
-            "project_name": clean_str(r.project_name),
-            "master_project": clean_str(r.master_project),
-            "nearest_landmark": clean_str(r.nearest_landmark),
-            "nearest_metro": clean_str(r.nearest_metro),
-            "nearest_mall": clean_str(r.nearest_mall),
+            "latitude": to_float(getattr(r, "gps_latitude", None)),
+            "longitude": to_float(getattr(r, "gps_longitude", None)),
+            "area_name": clean_str(getattr(r, "area_name", None)),
+            "building_name": clean_str(getattr(r, "building_name", None)),
+            "project_name": clean_str(getattr(r, "project_name", None)),
+            "master_project": clean_str(getattr(r, "master_project", None)),
+            "nearest_landmark": clean_str(getattr(r, "nearest_landmark", None)),
+            "nearest_metro": clean_str(getattr(r, "nearest_metro", None)),
+            "nearest_mall": clean_str(getattr(r, "nearest_mall", None)),
         })
 
-    # Drop FK to missing users for current_owner_id
-    existing_users = set(_read(conn, "SELECT user_id FROM users")["user_id"].tolist())
-    for row in prop_rows:
-        if row["current_owner_id"] not in existing_users:
-            row["current_owner_id"] = None
-
-    if prop_rows:
-        pd.DataFrame(prop_rows).to_sql("properties", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-    if loc_rows:
-        pd.DataFrame(loc_rows).to_sql("locations", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-
-    print(f"  properties: {len(prop_rows):,}")
-    print(f"  locations: {len(loc_rows):,}")
+    _write_df(conn, "properties", prop_rows)
+    _write_df(conn, "locations", loc_rows)
     return {r["property_id"] for r in prop_rows}
 
 
-def transform_transaction_types(conn, enriched: pd.DataFrame) -> dict[str, int]:
+def transform_transaction_types(conn, merged: pd.DataFrame) -> dict[str, int]:
     names = sorted({
         clean_str(x)
-        for x in enriched["procedure_name"].tolist() + enriched["reg_type"].tolist()
+        for x in merged.get("procedure_name", pd.Series(dtype=str)).tolist()
+        + merged.get("reg_type", pd.Series(dtype=str)).tolist()
         if clean_str(x)
     })
-    # Prefer procedure_name as the transaction type label; also keep reg_type values available
-    type_map: dict[str, int] = {}
     rows = [{"transaction_type_name": n, "description": n} for n in names]
-    if rows:
-        pd.DataFrame(rows).to_sql("transaction_types", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-    mapping_df = _read(conn, "SELECT transaction_type_id, transaction_type_name FROM transaction_types")
-    type_map = dict(zip(mapping_df["transaction_type_name"], mapping_df["transaction_type_id"]))
-    print(f"  transaction_types: {len(type_map):,}")
-    return type_map
+    _write_df(conn, "transaction_types", rows)
+    mapping_df = _read(conn, f"SELECT transaction_type_id, transaction_type_name FROM {MAIN}.transaction_types")
+    return dict(zip(mapping_df["transaction_type_name"], mapping_df["transaction_type_id"]))
 
 
-def transform_transactions(conn, enriched: pd.DataFrame, property_ids: set[str], type_map: dict[str, int]) -> set[str]:
+def transform_transactions(conn, merged: pd.DataFrame, property_ids: set[str], type_map: dict[str, int]) -> set[str]:
     rows = []
-    seen = set()
-    for r in enriched.itertuples(index=False):
+    seen: set[str] = set()
+    for r in merged.itertuples(index=False):
         tid = clean_str(r.transaction_id)
-        pid = normalize_property_id(r.property_id)
-        if tid is None or pid is None or tid in seen:
-            continue
-        if pid not in property_ids:
+        pid = normalize_property_id(getattr(r, "property_id", None))
+        if tid is None or pid is None or tid in seen or pid not in property_ids:
             continue
         seen.add(tid)
-        tname = clean_str(r.procedure_name) or clean_str(r.reg_type)
+        tname = clean_str(getattr(r, "procedure_name", None)) or clean_str(getattr(r, "reg_type", None))
+        tx_dt = to_timestamp(getattr(r, "transaction_datetime_src", None)) or to_timestamp(getattr(r, "instance_date", None))
         rows.append({
             "transaction_id": tid,
             "property_id": pid,
             "transaction_type_id": type_map.get(tname) if tname else None,
-            "transaction_group": clean_str(r.trans_group),
-            "registration_type": clean_str(r.reg_type),
-            "procedure_name": clean_str(r.procedure_name),
-            "transaction_date": to_date(r.instance_date),
-            "transaction_time": to_time(r.transaction_time),
-            "transaction_datetime": to_timestamp(r.full_timestamp),
-            "year": to_int(r.year),
-            "month": to_int(r.month),
-            "quarter": to_int(r.quarter),
-            "day_of_week": clean_str(r.day_of_week),
-            "day_of_month": to_int(r.day_of_month),
-            "current_value": to_float(r.actual_worth),
-            "previous_value": to_float(r.previous_value),
-            "transaction_value": to_float(r.actual_worth),
-            "value_change_pct": to_float(r.value_change_pct),
-            "procedure_area": to_float(r.procedure_area),
-            "meter_sale_price": to_float(r.meter_sale_price),
+            "transaction_group": clean_str(getattr(r, "trans_group", None)),
+            "registration_type": clean_str(getattr(r, "reg_type", None)),
+            "procedure_name": clean_str(getattr(r, "procedure_name", None)),
+            "transaction_datetime": tx_dt,
+            "transaction_value": to_float(getattr(r, "actual_worth", None)),
+            "previous_value": to_float(getattr(r, "previous_value", None)),
+            "value_change_pct": to_float(getattr(r, "value_change_pct", None)),
+            "procedure_area": to_float(getattr(r, "procedure_area", None)),
+            "meter_sale_price": to_float(getattr(r, "meter_sale_price", None)),
             "currency": "AED",
-            "rooms": clean_str(r.rooms),
-            "has_parking": to_bool(r.has_parking),
             "status": "Completed",
+            "procedure_id": clean_str(getattr(r, "procedure_id", None)),
+            "trans_group_id": clean_str(getattr(r, "trans_group_id", None)),
+            "area_id": clean_str(getattr(r, "area_id", None)),
+            "area_name": clean_str(getattr(r, "area_name", None)),
+            "project_number": clean_str(getattr(r, "project_number", None)),
+            "project_name": clean_str(getattr(r, "project_name", None)),
+            "master_project": clean_str(getattr(r, "master_project", None)),
+            "nearest_landmark": clean_str(getattr(r, "nearest_landmark", None)),
+            "rooms": clean_str(getattr(r, "rooms", None)),
+            "has_parking": to_bool(getattr(r, "has_parking", None)),
+            "created_at": tx_dt or datetime.utcnow(),
         })
 
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "property_transactions", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  property_transactions: {len(rows):,}")
+    _write_df(conn, "property_transactions", rows)
     return {r["transaction_id"] for r in rows}
 
 
-def transform_ownership(conn, enriched: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> None:
-    df = enriched.copy()
+def transform_ownership(conn, merged: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> None:
+    df = merged.copy()
     df["property_id_n"] = df["property_id"].map(normalize_property_id)
-    df["tx_dt"] = pd.to_datetime(df["full_timestamp"], errors="coerce")
-    df = df.dropna(subset=["property_id_n"])
-    df = df.sort_values(["property_id_n", "tx_dt", "transaction_id"])
+    df["tx_dt"] = pd.to_datetime(df["transaction_datetime_src"], errors="coerce")
+    df = df.dropna(subset=["property_id_n"]).sort_values(["property_id_n", "tx_dt", "transaction_id"])
 
-    existing_users = set(_read(conn, "SELECT user_id FROM users")["user_id"].tolist())
     rows = []
 
     for pid, group in df.groupby("property_id_n", sort=False):
@@ -268,10 +376,11 @@ def transform_ownership(conn, enriched: pd.DataFrame, property_ids: set[str], tx
         prev_idx = None
         for r in group.itertuples(index=False):
             tid = clean_str(r.transaction_id)
-            owner_id = clean_str(r.owner_id)
-            if owner_id not in existing_users:
-                owner_id = None
-            start = to_date(r.instance_date) or (to_timestamp(r.full_timestamp).date() if to_timestamp(r.full_timestamp) else None)
+            owner_id = clean_str(getattr(r, "owner_id", None))
+            start = to_date(getattr(r, "instance_date", None)) or (
+                to_timestamp(getattr(r, "transaction_datetime_src", None)).date()
+                if to_timestamp(getattr(r, "transaction_datetime_src", None)) else None
+            )
             if prev_idx is not None:
                 rows[prev_idx]["ownership_end_date"] = start
                 rows[prev_idx]["ownership_status"] = "Closed"
@@ -280,51 +389,18 @@ def transform_ownership(conn, enriched: pd.DataFrame, property_ids: set[str], tx
                 "owner_id": owner_id,
                 "ownership_start_date": start,
                 "ownership_end_date": None,
-                "ownership_type": clean_str(r.procedure_name) or "Transfer",
+                "ownership_type": clean_str(getattr(r, "procedure_name", None)) or "Transfer",
                 "transaction_id": tid if tid in tx_ids else None,
                 "ownership_status": "Current",
             })
             prev_idx = len(rows) - 1
 
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "property_ownership_history", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  property_ownership_history: {len(rows):,}")
+    _write_df(conn, "property_ownership_history", rows)
 
 
-def transform_classifications(conn, enriched: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> None:
+def transform_parties(conn, merged: pd.DataFrame, tx_ids: set[str], user_ids: set[str]) -> None:
     rows = []
-    for r in enriched.itertuples(index=False):
-        pid = normalize_property_id(r.property_id)
-        tid = clean_str(r.transaction_id)
-        if pid not in property_ids or tid not in tx_ids:
-            continue
-        rows.append({
-            "property_id": pid,
-            "transaction_id": tid,
-            "property_group": clean_str(r.property_group),
-            "property_type": clean_str(r.property_type),
-            "previous_subtype": clean_str(r.previous_sub_type),
-            "current_subtype": clean_str(r.property_sub_type),
-            "previous_usage_type": clean_str(r.previous_usage_type),
-            "current_usage_type": clean_str(r.property_usage),
-            "registration_type": clean_str(r.reg_type),
-            "land_type": clean_str(r.land_use_zone),
-            "land_use_zone": clean_str(r.land_use_zone),
-            "effective_date": to_date(r.instance_date),
-        })
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "property_classifications", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  property_classifications: {len(rows):,}")
-
-
-def transform_parties(conn, enriched: pd.DataFrame, tx_ids: set[str]) -> None:
-    existing_users = set(_read(conn, "SELECT user_id FROM users")["user_id"].tolist())
-    rows = []
-    seen = set()
+    seen: set[tuple] = set()
 
     def add(tid, role, user_id=None, name=None, primary=False):
         if tid not in tx_ids:
@@ -333,7 +409,7 @@ def transform_parties(conn, enriched: pd.DataFrame, tx_ids: set[str]) -> None:
         pname = clean_str(name)
         if uid is None and pname is None:
             return
-        if uid is not None and uid not in existing_users:
+        if uid is not None and uid not in user_ids:
             uid = None
         key = (tid, role, pname or uid or "")
         if key in seen:
@@ -347,166 +423,284 @@ def transform_parties(conn, enriched: pd.DataFrame, tx_ids: set[str]) -> None:
             "is_primary": primary,
         })
 
-    for r in enriched.itertuples(index=False):
+    for r in merged.itertuples(index=False):
         tid = clean_str(r.transaction_id)
         if tid is None:
             continue
-        add(tid, "Owner", r.owner_id, r.owner_name, primary=True)
-        add(tid, "Seller", r.seller_id, r.seller_name)
-        add(tid, "Notary", None, r.notary_name)
-        add(tid, "Witness", None, r.witness_1_name)
-        add(tid, "Witness", None, r.witness_2_name)
+        add(tid, "Owner", getattr(r, "owner_id", None), getattr(r, "owner_name", None), primary=True)
+        add(tid, "Seller", getattr(r, "seller_id", None), getattr(r, "seller_name", None))
+        add(tid, "Notary", None, getattr(r, "notary_name", None))
+        add(tid, "Witness", None, getattr(r, "witness_1_name", None))
+        add(tid, "Witness", None, getattr(r, "witness_2_name", None))
 
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "transaction_parties", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  transaction_parties: {len(rows):,}")
+    _write_df(conn, "transaction_parties", rows)
 
 
-def transform_registration(conn, enriched: pd.DataFrame, tx_ids: set[str]) -> None:
+def transform_registration(conn, merged: pd.DataFrame, tx_ids: set[str]) -> None:
     rows = []
-    seen = set()
-    for r in enriched.itertuples(index=False):
+    seen: set[str] = set()
+    for r in merged.itertuples(index=False):
         tid = clean_str(r.transaction_id)
         if tid is None or tid not in tx_ids or tid in seen:
             continue
         seen.add(tid)
         rows.append({
             "transaction_id": tid,
-            "registration_number": clean_str(r.title_deed_number),
-            "registration_date": to_date(r.instance_date),
-            "registration_fee": to_float(r.registration_fee_aed),
+            "registration_number": clean_str(getattr(r, "title_deed_number", None)),
+            "registration_date": to_date(getattr(r, "instance_date", None)),
+            "registration_fee": to_float(getattr(r, "registration_fee_aed", None)),
             "tax_amount": None,
-            "other_fee": to_float(r.trustee_office_fee_aed),
-            "total_amount_paid": to_float(r.total_fees_paid_aed),
+            "other_fee": to_float(getattr(r, "trustee_office_fee_aed", None)),
+            "total_amount_paid": to_float(getattr(r, "total_fees_paid_aed", None)),
             "currency": "AED",
-            "registration_status": clean_str(r.verification_status) or "Registered",
+            "registration_status": clean_str(getattr(r, "verification_status", None)) or "Registered",
         })
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "registration_details", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  registration_details: {len(rows):,}")
+    _write_df(conn, "registration_details", rows)
 
 
-def transform_documents(conn, enriched: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> None:
+def transform_documents(conn, merged: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> dict[str, int]:
     rows = []
-    for r in enriched.itertuples(index=False):
+    tx_to_doc: dict[str, int] = {}
+    for r in merged.itertuples(index=False):
         tid = clean_str(r.transaction_id)
-        pid = normalize_property_id(r.property_id)
+        pid = normalize_property_id(getattr(r, "property_id", None))
         if tid not in tx_ids or pid not in property_ids:
             continue
-        doc_text = clean_str(r.document_text)
-        doc_hash = clean_str(r.document_hash) or sha256_text(doc_text)
+        doc_text = clean_str(getattr(r, "document_text", None))
+        # Prefer existing document_hash; else keep plain document_text (app hashes later)
+        doc_hash = prefer_existing_or_plain(getattr(r, "document_hash", None), doc_text)
         if doc_text is None and doc_hash is None:
             continue
         rows.append({
             "property_id": pid,
             "transaction_id": tid,
             "document_type": "Title Deed",
-            "document_number": clean_str(r.title_deed_number),
+            "document_number": clean_str(getattr(r, "title_deed_number", None)),
             "document_text": doc_text,
             "document_hash": doc_hash,
             "document_url": None,
-            "issued_date": to_date(r.instance_date),
-            "verification_status": clean_str(r.verification_status),
+            "issued_date": to_date(getattr(r, "instance_date", None)),
+            "verification_status": clean_str(getattr(r, "verification_status", None)),
+            "created_at": to_timestamp(getattr(r, "transaction_datetime_src", None)) or datetime.utcnow(),
         })
+
     if rows:
         pd.DataFrame(rows).to_sql(
-            "property_documents", conn, if_exists="append", index=False, method="multi", chunksize=1000
+            "property_documents", conn, schema=MAIN, if_exists="append", index=False, method="multi", chunksize=1000
         )
-    print(f"  property_documents: {len(rows):,}")
+        docs = _read(conn, f"SELECT document_id, transaction_id FROM {MAIN}.property_documents")
+        tx_to_doc = dict(zip(docs["transaction_id"], docs["document_id"]))
+        print(f"  {MAIN}.property_documents: {len(rows):,}")
+    else:
+        print(f"  {MAIN}.property_documents: 0")
+    return tx_to_doc
 
 
-def transform_blockchain(conn, property_ids: set[str], tx_ids: set[str]) -> None:
-    bc = _read(conn, "SELECT * FROM staging_blockchain")
+def transform_blockchain(conn, merged: pd.DataFrame, property_ids: set[str], tx_ids: set[str]) -> None:
+    bc = _read(conn, "SELECT * FROM staging.blockchain")
     rows = []
-    seen_hash = set()
-    for r in bc.itertuples(index=False):
+    seen_hash: set[str] = set()
+
+    # Index merged enrichment blockchain fields by transaction_id
+    merged_bc = {}
+    for r in merged.itertuples(index=False):
         tid = clean_str(r.transaction_id)
-        pid = normalize_property_id(r.property_id)
-        tx_hash = clean_str(r.blockchain_transaction_hash)
+        if tid:
+            merged_bc[tid] = r
+
+    def add_row(tid, pid, tx_hash, r_src):
         if tx_hash is None or tx_hash in seen_hash:
-            continue
-        # Prefer linking when transaction exists; otherwise still store ledger row without FK if needed
-        if tid not in tx_ids:
+            return
+        if tid is not None and tid not in tx_ids:
             tid = None
-        if pid not in property_ids:
+        if pid is not None and pid not in property_ids:
             pid = None
         seen_hash.add(tx_hash)
         rows.append({
             "transaction_id": tid,
             "property_id": pid,
             "tx_hash": tx_hash,
-            "previous_hash": clean_str(r.previous_transaction_hash),
-            "property_hash": clean_str(r.property_hash),
-            "block_number": to_int(r.block_number),
-            "block_timestamp": to_timestamp(r.block_timestamp),
-            "from_wallet": clean_str(r.from_wallet),
-            "to_wallet": clean_str(r.to_wallet),
-            "transaction_type": clean_str(r.transaction_type),
-            "transaction_value_aed": to_float(r.transaction_value_aed),
-            "smart_contract_address": clean_str(r.smart_contract_address),
-            "digital_signature": clean_str(r.digital_signature),
-            "transaction_status": clean_str(r.transaction_status),
-            "consensus_verification": clean_str(r.consensus_verification),
-            "gas_fee_aed": to_float(r.gas_fee_aed),
+            "previous_hash": clean_str(getattr(r_src, "previous_transaction_hash", None)),
+            "property_hash": clean_str(getattr(r_src, "property_hash", None)),
+            "block_number": to_int(getattr(r_src, "block_number", None)),
+            "block_timestamp": to_timestamp(getattr(r_src, "block_timestamp", None)),
+            "from_wallet": clean_str(getattr(r_src, "from_wallet", None)),
+            "to_wallet": clean_str(getattr(r_src, "to_wallet", None)),
+            "transaction_type": clean_str(getattr(r_src, "transaction_type", None)),
+            "transaction_value": to_float(getattr(r_src, "transaction_value_aed", None)),
+            "smart_contract_address": clean_str(getattr(r_src, "smart_contract_address", None)),
+            "digital_signature": clean_str(getattr(r_src, "digital_signature", None)),
+            "transaction_status": clean_str(getattr(r_src, "transaction_status", None)),
+            "consensus_verification": clean_str(getattr(r_src, "consensus_verification", None)),
+            "gas_fee": to_float(getattr(r_src, "gas_fee_aed", None)),
+            "created_at": to_timestamp(getattr(r_src, "block_timestamp", None)) or datetime.utcnow(),
         })
-    if rows:
-        pd.DataFrame(rows).to_sql(
-            "blockchain_transactions", conn, if_exists="append", index=False, method="multi", chunksize=1000
-        )
-    print(f"  blockchain_transactions: {len(rows):,}")
+
+    for r in bc.itertuples(index=False):
+        tid = clean_str(r.transaction_id)
+        pid = normalize_property_id(r.property_id)
+        tx_hash = clean_str(r.blockchain_transaction_hash)
+        add_row(tid, pid, tx_hash, r)
+
+    # Supplement from merged enrichment where ledger row may be missing
+    for tid, r in merged_bc.items():
+        tx_hash = clean_str(getattr(r, "blockchain_transaction_hash", None))
+        if tx_hash:
+            pid = normalize_property_id(getattr(r, "property_id", None))
+            add_row(tid, pid, tx_hash, r)
+
+    _write_df(conn, "blockchain_transactions", rows)
 
 
-def transform_query_logs(conn) -> None:
-    ql = _read(conn, "SELECT * FROM staging_query_logs")
-    existing_users = set(_read(conn, "SELECT user_id FROM users")["user_id"].tolist())
+def transform_transaction_features(
+    conn, merged: pd.DataFrame, property_ids: set[str], tx_ids: set[str], tx_to_doc: dict[str, int]
+) -> None:
+    df = merged.copy()
+    df["property_id_n"] = df["property_id"].map(normalize_property_id)
+    df["tx_dt"] = pd.to_datetime(df["transaction_datetime_src"], errors="coerce")
+    df = df.dropna(subset=["property_id_n", "transaction_id"])
+    df["transaction_id"] = df["transaction_id"].map(clean_str)
+    df = df[df["transaction_id"].isin(tx_ids) & df["property_id_n"].isin(property_ids)]
+    df = df.sort_values(["property_id_n", "tx_dt", "transaction_id"])
+
+    df["actual_worth_f"] = df["actual_worth"].map(to_float)
+    df["procedure_area_f"] = df["procedure_area"].map(to_float)
+    df["price_per_area"] = df["actual_worth_f"] / df["procedure_area_f"]
+    df.loc[df["procedure_area_f"].isna() | (df["procedure_area_f"] == 0), "price_per_area"] = pd.NA
+
+    area_medians = (
+        df.groupby(df["area_name"].fillna("UNKNOWN"))["price_per_area"]
+        .median()
+        .to_dict()
+    )
+
     rows = []
-    seen = set()
+    for pid, group in df.groupby("property_id_n", sort=False):
+        group = group.reset_index(drop=True)
+        tx_dts = group["tx_dt"]
+        for i in range(len(group)):
+            r = group.iloc[i]
+            tid = r["transaction_id"]
+            tx_dt = r["tx_dt"]
+            prop_hist_len = i + 1
+            if pd.notna(tx_dt):
+                last_90 = int(((tx_dts <= tx_dt) & (tx_dts >= tx_dt - pd.Timedelta(days=90))).sum())
+                last_365 = int(((tx_dts <= tx_dt) & (tx_dts >= tx_dt - pd.Timedelta(days=365))).sum())
+                prev = tx_dts[tx_dts < tx_dt]
+                days_since = int((tx_dt - prev.max()).days) if len(prev) else None
+            else:
+                last_90 = last_365 = 0
+                days_since = None
+
+            doc_text = clean_str(r.get("document_text"))
+            doc_hash = clean_str(r.get("document_hash"))
+            doc_count = 1 if doc_text or doc_hash else 0
+            enc = clean_str(r.get("encumbrances"))
+            has_encumbrance = enc is not None and enc.lower() not in {"none", "clear", "no encumbrances"}
+            owner_id = clean_str(r.get("owner_id"))
+            seller_id = clean_str(r.get("seller_id"))
+            seller_matches = owner_id == seller_id if owner_id and seller_id else None
+            prev_hash = clean_str(r.get("previous_transaction_hash"))
+            tx_hash = clean_str(r.get("blockchain_transaction_hash"))
+            hash_chain_valid = bool(prev_hash and tx_hash)
+
+            area = str(r.get("area_name") or "UNKNOWN")
+            median = area_medians.get(area)
+            ppa = to_float(r.get("price_per_area"))
+            deviation = ((ppa - median) / median * 100) if ppa and median and not pd.isna(median) else None
+
+            rows.append({
+                "transaction_id": tid,
+                "property_id": pid,
+                "price_per_area": ppa,
+                "price_deviation_from_area_median": deviation,
+                "ownership_change_count": prop_hist_len,
+                "transactions_last_90_days": int(last_90),
+                "transactions_last_365_days": int(last_365),
+                "days_since_previous_transaction": days_since,
+                "value_change_pct": to_float(r.get("value_change_pct")),
+                "document_count": doc_count,
+                "missing_document_count": 0 if doc_count else 1,
+                "hash_chain_valid": hash_chain_valid,
+                "seller_matches_owner": seller_matches,
+                "has_active_encumbrance": has_encumbrance,
+                "duplicate_document_count": 0,
+            })
+
+    _write_df(conn, "transaction_features", rows)
+
+
+def transform_query_logs_and_retrievals(conn, tx_ids: set[str], tx_to_doc: dict[str, int], user_ids: set[str]) -> None:
+    ql = _read(conn, "SELECT * FROM staging.query_logs")
+
+    log_rows = []
+    retrieval_rows = []
+    seen: set[str] = set()
+
     for r in ql.itertuples(index=False):
         qid = clean_str(r.query_id)
         if qid is None or qid in seen:
             continue
         seen.add(qid)
         uid = clean_str(r.user_id)
-        if uid not in existing_users:
+        if uid not in user_ids:
             uid = None
-        rows.append({
+        relevance = to_float(r.relevance_score)
+        latency = to_int(r.response_latency_ms)
+        log_rows.append({
             "query_id": qid,
             "user_id": uid,
             "query_text": clean_str(r.query_text),
-            "retrieved_transaction_ids": clean_str(r.retrieved_transaction_ids),
-            "relevance_score": to_float(r.relevance_score),
+            "log_timestamp": datetime.utcnow() - timedelta(milliseconds=latency or 0),
+            "agent_response": f"Retrieved relevant property records for query {qid}.",
+            "confidence_score": relevance,
+            "relevance_score": relevance,
             "flagged_suspicious": to_bool(r.flagged_suspicious) or False,
-            "response_time_ms": to_int(r.response_latency_ms),
-            "agent_used": "IR",
+            "agent_used": "IR-Agent",
+            "response_time_ms": latency,
         })
-    if rows:
-        pd.DataFrame(rows).to_sql("query_logs", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-    print(f"  query_logs: {len(rows):,}")
+
+        for rank, tx_id in enumerate(split_csv_ids(r.retrieved_transaction_ids), start=1):
+            tid = clean_str(tx_id)
+            if tid and tid not in tx_ids:
+                tid = None
+            retrieval_rows.append({
+                "query_id": qid,
+                "transaction_id": tid,
+                "document_id": tx_to_doc.get(tid) if tid else None,
+                "rank": rank,
+                "relevance_score": relevance,
+            })
+
+    _write_df(conn, "query_logs", log_rows)
+    _write_df(conn, "query_retrievals", retrieval_rows)
 
 
 def run_all_transforms(conn) -> None:
-    print("Clearing final tables…")
+    print("Clearing main tables…")
     _clear_final_tables(conn)
 
-    print("Reading staging_property_enriched…")
-    enriched = _read(conn, "SELECT * FROM staging_property_enriched")
-    # Deduplicate exact duplicate transaction_ids keeping first
-    enriched = enriched.drop_duplicates(subset=["transaction_id"], keep="first")
+    print("Loading users (system seeds + staging stakeholders)…")
+    user_ids = transform_users(conn)
 
-    print("Transforming…")
-    transform_users(conn, enriched)
-    property_ids = transform_properties_and_locations(conn, enriched)
-    type_map = transform_transaction_types(conn, enriched)
-    tx_ids = transform_transactions(conn, enriched, property_ids, type_map)
-    transform_ownership(conn, enriched, property_ids, tx_ids)
-    transform_classifications(conn, enriched, property_ids, tx_ids)
-    transform_parties(conn, enriched, tx_ids)
-    transform_registration(conn, enriched, tx_ids)
-    transform_documents(conn, enriched, property_ids, tx_ids)
-    transform_blockchain(conn, property_ids, tx_ids)
-    transform_query_logs(conn)
+    print("Reading staging sources…")
+    transactions = _read(conn, "SELECT * FROM staging.transactions")
+    enriched = _read(conn, "SELECT * FROM staging.property_enriched")
+
+    print("Merging transactions + enrichment on transaction_id…")
+    merged = merge_transaction_sources(transactions, enriched)
+    print(f"  merged transaction rows: {len(merged):,}")
+
+    print("Transforming into main.* …")
+    property_ids = transform_properties_and_locations(conn, merged, user_ids)
+    type_map = transform_transaction_types(conn, merged)
+    tx_ids = transform_transactions(conn, merged, property_ids, type_map)
+    transform_ownership(conn, merged, property_ids, tx_ids)
+    transform_parties(conn, merged, tx_ids, user_ids)
+    transform_registration(conn, merged, tx_ids)
+    tx_to_doc = transform_documents(conn, merged, property_ids, tx_ids)
+    transform_blockchain(conn, merged, property_ids, tx_ids)
+    transform_transaction_features(conn, merged, property_ids, tx_ids, tx_to_doc)
+    transform_query_logs_and_retrievals(conn, tx_ids, tx_to_doc, user_ids)
     print("Transforms complete.")
+    print("  (Category C runtime tables left empty: risk_assessments, risk_indicators, agent_runs)")

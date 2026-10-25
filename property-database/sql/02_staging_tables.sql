@@ -1,14 +1,19 @@
--- Staging tables: 1:1 with cleaned CSVs. Safe to drop/reload.
--- Connect to property_db before running.
+-- Staging layer: dedicated `staging` schema, all ingest columns as TEXT.
+-- Application/API reads core.* only. staging.users is reference ingest (not loaded to core.users).
+-- Safe to drop/reload. Connect to property_db before running.
 
-DROP TABLE IF EXISTS staging_property_features CASCADE;
-DROP TABLE IF EXISTS staging_query_logs CASCADE;
-DROP TABLE IF EXISTS staging_blockchain CASCADE;
-DROP TABLE IF EXISTS staging_transactions CASCADE;
-DROP TABLE IF EXISTS staging_property_enriched CASCADE;
-DROP TABLE IF EXISTS staging_users CASCADE;
+DROP SCHEMA IF EXISTS staging CASCADE;
+CREATE SCHEMA staging;
 
-CREATE TABLE staging_users (
+-- Drop legacy public staging tables if they exist from older runs
+DROP TABLE IF EXISTS public.staging_property_features CASCADE;
+DROP TABLE IF EXISTS public.staging_query_logs CASCADE;
+DROP TABLE IF EXISTS public.staging_blockchain CASCADE;
+DROP TABLE IF EXISTS public.staging_transactions CASCADE;
+DROP TABLE IF EXISTS public.staging_property_enriched CASCADE;
+DROP TABLE IF EXISTS public.staging_users CASCADE;
+
+CREATE TABLE staging.users (
     staging_id              BIGSERIAL PRIMARY KEY,
     user_id                 TEXT,
     full_name               TEXT,
@@ -24,7 +29,7 @@ CREATE TABLE staging_users (
     loaded_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE staging_property_enriched (
+CREATE TABLE staging.property_enriched (
     staging_id                      BIGSERIAL PRIMARY KEY,
     property_id                     TEXT,
     transaction_id                  TEXT,
@@ -107,7 +112,7 @@ CREATE TABLE staging_property_enriched (
     loaded_at                       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE staging_transactions (
+CREATE TABLE staging.transactions (
     staging_id              BIGSERIAL PRIMARY KEY,
     transaction_id          TEXT,
     procedure_id            TEXT,
@@ -145,7 +150,7 @@ CREATE TABLE staging_transactions (
     loaded_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE staging_blockchain (
+CREATE TABLE staging.blockchain (
     staging_id                      BIGSERIAL PRIMARY KEY,
     transaction_id                  TEXT,
     blockchain_transaction_hash     TEXT,
@@ -166,7 +171,7 @@ CREATE TABLE staging_blockchain (
     loaded_at                       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE staging_query_logs (
+CREATE TABLE staging.query_logs (
     staging_id                  BIGSERIAL PRIMARY KEY,
     query_id                    TEXT,
     user_id                     TEXT,
@@ -176,12 +181,4 @@ CREATE TABLE staging_query_logs (
     response_latency_ms         TEXT,
     flagged_suspicious          TEXT,
     loaded_at                   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Optional; not used by default ETL
-CREATE TABLE staging_property_features (
-    staging_id              BIGSERIAL PRIMARY KEY,
-    -- same columns as staging_property_enriched plus:
-    registration_quarter    TEXT,
-    loaded_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

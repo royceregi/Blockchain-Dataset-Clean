@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -31,7 +32,6 @@ def normalize_property_id(val: Any) -> Optional[str]:
     if s is None:
         return None
     try:
-        # Prefer integer form when the value is numeric
         return str(int(float(s)))
     except (ValueError, OverflowError):
         return s
@@ -68,32 +68,21 @@ def to_date(val: Any):
     s = clean_str(val)
     if s is None:
         return None
-    parsed = pd.to_datetime(s, errors="coerce")
+    parsed = pd.to_datetime(s, errors="coerce", utc=False)
     if pd.isna(parsed):
         return None
     return parsed.date()
-
-
-def to_time(val: Any):
-    s = clean_str(val)
-    if s is None:
-        return None
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            return datetime.strptime(s, fmt).time()
-        except ValueError:
-            continue
-    return None
 
 
 def to_timestamp(val: Any):
     s = clean_str(val)
     if s is None:
         return None
-    parsed = pd.to_datetime(s, errors="coerce")
+    parsed = pd.to_datetime(s, errors="coerce", utc=False)
     if pd.isna(parsed):
         return None
-    return parsed.to_pydatetime()
+    ts = parsed.to_pydatetime()
+    return ts.replace(tzinfo=None) if ts.tzinfo else ts
 
 
 def sha256_text(val: Any) -> Optional[str]:
@@ -103,5 +92,42 @@ def sha256_text(val: Any) -> Optional[str]:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def prefer_existing_or_plain(existing: Any, plain: Any = None) -> Optional[str]:
+    """Use an already-hashed/canonical value when present; otherwise keep plain text.
+
+    App-side hashing can be applied later. Never invent a new hash here.
+    """
+    existing_s = clean_str(existing)
+    if existing_s is not None:
+        return existing_s
+    return clean_str(plain)
+
+
 def username_from_user_id(user_id: str) -> str:
     return user_id.lower()
+
+
+def demo_password_hash(user_id: str) -> str:
+    """Generate a deterministic demo password hash; never store raw dataset auth hashes."""
+    salt = hashlib.sha256(f"propguard-demo-{user_id}".encode()).hexdigest()[:32]
+    digest = hashlib.pbkdf2_hmac("sha256", b"PropGuardDemo2024!", salt.encode(), 10_000)
+    return f"pbkdf2_sha256$10000${salt}${digest.hex()}"
+
+
+def split_csv_ids(val: Any) -> list[str]:
+    """Split comma/semicolon-separated ID lists from query logs."""
+    s = clean_str(val)
+    if s is None:
+        return []
+    parts = re.split(r"[,;|]+", s)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def risk_level_from_score(score: float) -> str:
+    if score >= 75:
+        return "Critical"
+    if score >= 50:
+        return "High"
+    if score >= 25:
+        return "Medium"
+    return "Low"
